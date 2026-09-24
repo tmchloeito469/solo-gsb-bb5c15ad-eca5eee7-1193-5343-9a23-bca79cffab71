@@ -16,6 +16,9 @@
 - 提供**注册表版本退役评估**：在内存中移除指定包的单个版本，用每条已保存可行审计的
   原清单逐条重新求解，返回原解/重跑状态/选中版本差异并给出总体可退役结论，
   不写入注册表或审计；
+- 提供**共享安装方案求解**：把 2～20 条已保存可行审计的原始清单合并为同一组约束
+  （显式依赖 + 根插件固定版本），求一套可同时安装的版本组合，同名包只选一个版本，
+  不写入注册表或审计；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -826,6 +829,96 @@ curl -s -X POST http://localhost:8000/api/v1/registry/retirements/preview \
 - **只读**：不修改注册表（随后 `GET /api/v1/registry/packages` 结果不变），
   也不写审计记录或异步作业。
 
+### 12. 共享安装方案（合并多份可行审计的约束，只读）
+
+把 2～20 条**已保存且状态为 feasible** 的审计 ID 交给共享安装方案接口：
+服务读取各审计**保存时的原始清单**，把所有清单的**显式依赖**与**根插件的
+`=版本` 固定约束**合并为同一组根约束，调用现有求解器求出一套**可同时安装**
+的版本组合。根插件在注册表中声明的传递依赖随求解展开、一并参与；
+同名包在解中只出现一个版本。接口只读：不新增审计记录，也不修改注册表。
+
+先保存两条各自可行的审计，再求共享安装方案：
+
+```bash
+# 审计 A：core-lib ^1.0.0
+AUDIT_A=$(curl -s -X POST http://localhost:8000/api/v1/audits \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies":[{"name":"core-lib","range":"^1.0.0"}]}' | jq -r .id)
+
+# 审计 B：cachekit ^1.0.0（其 1.3.0 依赖 core-lib ^1.4.0）
+AUDIT_B=$(curl -s -X POST http://localhost:8000/api/v1/audits \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies":[{"name":"cachekit","range":"^1.0.0"}]}' | jq -r .id)
+
+curl -s -X POST http://localhost:8000/api/v1/audits/shared-resolution \
+  -H 'Content-Type: application/json' \
+  -d "{\"audit_ids\":[\"$AUDIT_A\",\"$AUDIT_B\"]}" | jq
+```
+
+返回（节选）：
+
+```json
+{
+  "audit_ids": ["…A…", "…B…"],
+  "requested_audit_count": 2,
+  "duplicate_audit_ids": [],
+  "status": "feasible",
+  "resolution": {"cachekit": "1.3.0", "core-lib": "1.5.0"},
+  "sources": [ /* 每个被选中版本的全部约束及来源链 */ ],
+  "conflicts": [],
+  "node_count": 2,
+  "explanation": "找到可行版本组合，共 2 个包",
+  "manifests": [
+    {"audit_id": "…A…", "plugin_name": null, "plugin_version": null,
+     "dependencies": [{"name": "core-lib", "range": "^1.0.0"}]},
+    {"audit_id": "…B…", "plugin_name": null, "plugin_version": null,
+     "dependencies": [{"name": "cachekit", "range": "^1.0.0"}]}
+  ],
+  "merged_constraints": [
+    {"name": "core-lib", "range": "^1.0.0"},
+    {"name": "cachekit", "range": "^1.0.0"}
+  ]
+}
+```
+
+无解时（例如一条要 `core-lib ^1.0.0`、另一条要 `core-lib ^2.0.0`，或两条清单
+把同一包固定为不同的根插件版本）返回 `status=infeasible` 与全部最小冲突链，
+冲突链形态与单条审计接口一致（`minimal_constraints` 含逐跳来源链）：
+
+```json
+{
+  "status": "infeasible",
+  "resolution": null,
+  "conflicts": [
+    {
+      "package": "core-lib",
+      "kind": "range_conflict",
+      "minimal_constraints": [
+        {"package": "core-lib", "version_range": "^1.0.0",
+         "source_chain": [{"package": "<manifest>", "version_range": "*", "version": null}]},
+        {"package": "core-lib", "version_range": "^2.0.0",
+         "source_chain": [{"package": "<manifest>", "version_range": "*", "version": null}]}
+      ]
+    }
+  ]
+}
+```
+
+要点：
+
+- **去重语义**：重复 ID 按首次出现顺序去重（`duplicate_audit_ids` 列出重复项），
+  `audit_ids` / `manifests` 按去重后顺序返回；**去重后不足 2 条不同 ID 返回 422**；
+- **合并语义**：每份清单先贡献根插件的 `=版本` 固定约束（若声明了根插件），
+  再按声明顺序贡献显式依赖；`merged_constraints` 原样列出合并后的根约束组，
+  同名包在解中只会选中一个版本；
+- **根插件传递依赖参与**：根插件固定版本入选后，其在注册表中声明的依赖
+  照常展开（例如 `megaplugin@1.0.0` 会把 `authkit` / `httpkit` 引入共享求解）；
+- **搜索预算耗尽**：合并求解超过节点预算（默认 20000）时返回 `inconclusive`，
+  `resolution` 与 `conflicts` 均为空，**不宣称无解**；
+- **错误码**：任一审计 ID 不存在返回 `404`；审计存在但状态不是 `feasible`
+  返回 `422`；空 ID、少于 2 个、超过 20 个 ID 返回 `422`；
+- **只读**：不新增审计记录（审计总数不变），也不修改注册表，可重复调用。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -833,6 +926,7 @@ curl -s -X POST http://localhost:8000/api/v1/registry/retirements/preview \
 | `GET`  | `/health` | 健康检查（含数据库连通性与注册表包数量） |
 | `POST` | `/api/v1/audits` | 提交清单进行审计，返回求解结果并落库（`201`） |
 | `POST` | `/api/v1/audits/batch` | 批量审计 1～20 个清单：按序独立求解并分别落库，逐项返回 audit_id/status 或结构化 error（`200`；空列表或超过 20 项返回 `422`） |
+| `POST` | `/api/v1/audits/shared-resolution` | 共享安装方案：合并 2～20 条已保存可行审计的原始清单约束（显式依赖 + 根插件 `=版本` 固定约束，ID 去重），求一套可同时安装的版本，同名包只选一个版本（只读）；ID 不存在 `404`，非可行审计或去重后不足 2 条 `422` |
 | `POST` | `/api/v1/audit-jobs` | 异步作业：提交单条 `manifest` 或 1～20 条 `manifests`，立即 `202` 返回 job_id，后台按序逐项求解落库 |
 | `GET`  | `/api/v1/audit-jobs/{job_id}` | 查询作业：queued/running/succeeded/failed 状态、六态完成计数与逐项结果 |
 | `DELETE` | `/api/v1/audit-jobs/{job_id}/items/{index}` | 取消作业中尚未开始（queued）的条目（`200`；已开始/已结束 `409`；越界/作业不存在 `404`） |
@@ -908,6 +1002,9 @@ pytest -q
 注册表版本退役评估（内存移除单版本、重复审计 ID 去重与输入顺序、原清单逐条重跑的
 feasible/infeasible/inconclusive/unavailable 四态、根插件版本移除标不可用、
 版本解差异与不确定不推断、总体 can_retire、版本/审计不存在 404 与非可行 422、只读不落库），
+共享安装方案（显式依赖与根插件固定版本合并约束、根插件传递依赖参与、同名包单版本、
+重复 ID 去重与去重后不足 2 条 422、ID 不存在 404、非可行 422、
+预算耗尽 inconclusive 不宣称无解、只读不落库），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
 ## 项目结构
@@ -926,6 +1023,7 @@ app/
   cycles.py     # 只读注册表循环依赖诊断：按依赖范围构图 + Tarjan 强连通分量（纯内存）
   preview.py    # 注册表变更预演：内存构造写入快照、双注册表求解对比与变化分区（纯内存）
   retirement.py # 注册表版本退役评估：内存移除单版本、原清单逐条重跑与差异/可用性判定（纯内存）
+  shared.py     # 共享安装方案：多份可行审计清单合并约束、单次求解共享版本组合（纯内存）
   bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
 data/
   seed_registry.json   # 示例注册表

@@ -441,6 +441,101 @@ class AuditResponse(BaseModel):
     conflicts: List[ConflictOut]
 
 
+# ---------- 共享安装方案 ----------
+
+
+class SharedResolutionIn(BaseModel):
+    """共享安装方案请求：2～20 个已保存的可行审计 ID。
+
+    重复 ID 按首次出现顺序去重（不视为错误）；去重后不足 2 条不同 ID
+    时整体请求非法（422）。
+    """
+
+    audit_ids: List[str] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description="已保存的可行审计 ID 列表（2～20 个）；重复 ID 自动去重",
+    )
+
+    @field_validator("audit_ids")
+    @classmethod
+    def _validate_audit_ids(cls, value: List[str]) -> List[str]:
+        for audit_id in value:
+            if not isinstance(audit_id, str) or not audit_id.strip():
+                raise ValueError("audit_id 不能为空")
+        return value
+
+    def deduped_audit_ids(self) -> List[str]:
+        """按首次出现顺序去重后的审计 ID。"""
+        seen: set[str] = set()
+        result: List[str] = []
+        for audit_id in self.audit_ids:
+            if audit_id not in seen:
+                seen.add(audit_id)
+                result.append(audit_id)
+        return result
+
+
+class SharedResolutionManifestOut(BaseModel):
+    """单个参与审计贡献给共享求解的原始清单约束。"""
+
+    audit_id: str = Field(..., description="参与求解的已保存审计 ID")
+    plugin_name: Optional[str] = Field(
+        None, description="清单声明的根插件名；其固定版本以 =版本 约束并入求解"
+    )
+    plugin_version: Optional[str] = Field(None, description="清单声明的根插件版本")
+    dependencies: List[DependencySpec] = Field(
+        default_factory=list, description="清单显式声明的依赖（原样并入求解）"
+    )
+
+
+class MergedConstraintOut(BaseModel):
+    """合并后根约束组中的一条约束（显式依赖或根插件 =版本 固定约束）。"""
+
+    name: str = Field(..., description="被约束的包名")
+    range: str = Field(..., description="SemVer 版本范围（根插件固定版本为 =版本）")
+
+
+class SharedResolutionResponse(BaseModel):
+    """POST /api/v1/audits/shared-resolution：共享安装方案求解结果（只读）。"""
+
+    audit_ids: List[str] = Field(
+        ..., description="去重后参与求解的审计 ID（按首次出现顺序）"
+    )
+    requested_audit_count: int = Field(
+        ..., description="请求提交的审计 ID 数量（含重复）"
+    )
+    duplicate_audit_ids: List[str] = Field(
+        ..., description="请求中重复出现的审计 ID（稳定排序去重列出）"
+    )
+    status: Literal["feasible", "infeasible", "inconclusive"] = Field(
+        ...,
+        description="共享求解状态；搜索预算耗尽时为 inconclusive（不宣称无解）",
+    )
+    resolution: Optional[Dict[str, str]] = Field(
+        None,
+        description="可行时的共享版本解（包名 -> 版本，同名包仅一个版本）；否则为 null",
+    )
+    sources: Optional[List[ResolutionSourceOut]] = Field(
+        None, description="可行时每个被选中版本的全部约束及来源链"
+    )
+    conflicts: List[ConflictOut] = Field(
+        default_factory=list,
+        description="搜索穷尽仍无解时的全部最小冲突链；feasible/inconclusive 时为空",
+    )
+    node_count: int = Field(..., description="求解器实际搜索的节点数")
+    explanation: str = Field(..., description="求解结论的文字说明")
+    manifests: List[SharedResolutionManifestOut] = Field(
+        ..., description="各参与审计的原始清单约束（顺序与 audit_ids 一致）"
+    )
+    merged_constraints: List[MergedConstraintOut] = Field(
+        ...,
+        description="合并后的根约束组：各清单显式依赖 + 根插件 =版本 固定约束（按参与顺序）",
+    )
+
+
+
 # ---------- 批量审计 ----------
 
 
