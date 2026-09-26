@@ -74,10 +74,13 @@ from .models import (
     RetirementPreviewIn,
     RetirementPreviewResponse,
     RetirementResolutionDiffOut,
+    SharedResolutionIn,
+    SharedResolutionResponse,
 )
 from .preview import build_preview_body, build_preview_registry
 from .retirement import evaluate_retirement, sorted_duplicate_ids
 from .semver import Version, VersionError
+from .shared import solve_shared_resolution
 from .solver import Solver
 from .summary import InvalidTimeBound, build_audit_summary, parse_utc_bound
 
@@ -138,6 +141,7 @@ def index() -> dict:
             "GET /health",
             "POST /api/v1/audits",
             "POST /api/v1/audits/batch",
+            "POST /api/v1/audits/shared-resolution",
             "GET /api/v1/audits",
             "GET /api/v1/audits/summary",
             "GET /api/v1/audits/{audit_id}",
@@ -378,6 +382,83 @@ def create_audits_batch(payload: BatchAuditIn, request: Request) -> BatchAuditRe
         inconclusive=counts["inconclusive"],
         error=counts["error"],
         items=items,
+    )
+
+
+@app.post(
+    "/api/v1/audits/shared-resolution",
+    response_model=SharedResolutionResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["audits"],
+    summary="共享安装方案：合并多条可行审计的约束，求一套可同时安装的版本（只读）",
+)
+def shared_resolution(payload: SharedResolutionIn, request: Request) -> SharedResolutionResponse:
+    """读取多条已保存**可行**审计的原始清单，把全部显式依赖与根插件固定版本
+    合并为同一组约束，用现有求解器求一套可同时安装的版本组合。
+
+    * 请求携带 2～20 个审计 ID；重复 ID 按首次出现顺序去重，
+      去重后不足 2 个返回 ``422``；
+    * 任一审计 ID 不存在返回 ``404``；审计存在但状态不是 feasible 返回 ``422``；
+    * 根插件以 ``=版本`` 精确约束参与求解，其注册表传递依赖随求解自动展开；
+      同名包在解中只会被锁定一个版本；
+    * 搜索预算耗尽时返回 ``inconclusive``（不宣称无解）；
+    * **只读**：不产生审计记录，也不修改注册表，可重复调用。
+    """
+    conn = get_conn(request)
+    registry = load_registry(conn)
+
+    # 重复 ID 去重（保留首次出现顺序）；去重后不足 2 条无法构成“共享”
+    audit_ids = payload.deduped_audit_ids()
+    if len(audit_ids) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="去重后不足 2 个审计 ID，无法求共享安装方案（至少需要 2 个不同的审计）",
+        )
+
+    rows = []
+    missing_ids: list[str] = []
+    non_feasible: list[str] = []
+    for audit_id in audit_ids:
+        row = get_audit(conn, audit_id)
+        if row is None:
+            missing_ids.append(audit_id)
+            continue
+        if row["status"] != "feasible":
+            non_feasible.append(audit_id)
+            continue
+        rows.append(row)
+
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"审计记录不存在: {missing_ids}",
+        )
+    if non_feasible:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "共享安装方案只接受状态为 feasible 的审计，以下审计不可参与: "
+                f"{non_feasible}"
+            ),
+        )
+
+    manifests = [
+        ManifestIn.model_validate(json.loads(row["manifest_json"])) for row in rows
+    ]
+    result = solve_shared_resolution(
+        manifests, registry, solver_factory=lambda reg: Solver(reg)
+    )
+
+    return SharedResolutionResponse(
+        requested_audit_count=len(payload.audit_ids),
+        duplicate_audit_ids=sorted_duplicate_ids(payload.audit_ids),
+        audit_ids=audit_ids,
+        status=result.status,
+        resolution=result.resolution,
+        sources=result.sources,
+        conflicts=result.conflicts,
+        node_count=result.node_count,
+        explanation=result.explanation,
     )
 
 

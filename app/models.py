@@ -319,6 +319,42 @@ class RetirementPreviewResponse(BaseModel):
     )
 
 
+# ---------- 共享安装方案 ----------
+
+
+class SharedResolutionIn(BaseModel):
+    """共享安装方案请求：2～20 个已保存的 feasible 审计 ID。
+
+    重复的审计 ID 按首次出现顺序自动去重，不视为错误；
+    但去重后不足 2 个时无法构成“共享”，返回 422。
+    """
+
+    audit_ids: List[str] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description="已保存的 feasible 审计 ID 列表（2～20 个）；重复 ID 自动去重",
+    )
+
+    @field_validator("audit_ids")
+    @classmethod
+    def _validate_audit_ids(cls, value: List[str]) -> List[str]:
+        for audit_id in value:
+            if not isinstance(audit_id, str) or not audit_id.strip():
+                raise ValueError("audit_id 不能为空")
+        return value
+
+    def deduped_audit_ids(self) -> List[str]:
+        """按首次出现顺序去重后的审计 ID。"""
+        seen: set[str] = set()
+        result: List[str] = []
+        for audit_id in self.audit_ids:
+            if audit_id not in seen:
+                seen.add(audit_id)
+                result.append(audit_id)
+        return result
+
+
 # ---------- 注册表循环依赖诊断 ----------
 
 
@@ -439,6 +475,37 @@ class AuditResponse(BaseModel):
     resolution: Optional[Dict[str, str]]
     sources: Optional[List[ResolutionSourceOut]]
     conflicts: List[ConflictOut]
+
+
+class SharedResolutionResponse(BaseModel):
+    """POST /api/v1/audits/shared-resolution：共享安装方案求解结果（只读、纯内存）。"""
+
+    requested_audit_count: int = Field(
+        ..., description="请求提交的审计 ID 数量（含重复）"
+    )
+    duplicate_audit_ids: List[str] = Field(
+        ..., description="请求中重复出现的审计 ID（稳定排序去重列出）"
+    )
+    audit_ids: List[str] = Field(
+        ..., description="实际参与求解的审计 ID（去重后，按首次出现顺序）"
+    )
+    status: Literal["feasible", "infeasible", "inconclusive"] = Field(
+        ...,
+        description="合并约束的求解状态；搜索预算耗尽时为 inconclusive（不宣称无解）",
+    )
+    resolution: Optional[Dict[str, str]] = Field(
+        None,
+        description="可行时的共享版本解（包名 -> 版本，同名包仅一个版本）；否则为 null",
+    )
+    sources: Optional[List[ResolutionSourceOut]] = Field(
+        None, description="可行时每个被选中版本的全部约束及来源链；否则为 null"
+    )
+    conflicts: List[ConflictOut] = Field(
+        default_factory=list,
+        description="无解时的全部最小冲突链（含逐跳来源）；可行/不确定时为空列表",
+    )
+    node_count: int = Field(..., description="求解消耗的搜索节点数")
+    explanation: str = Field(..., description="求解结论的文字说明")
 
 
 # ---------- 批量审计 ----------
